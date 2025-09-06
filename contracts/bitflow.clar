@@ -390,3 +390,92 @@
         (ok (var-set governance-token (some token)))
     )
 )
+
+(define-public (stake-governance (token <ft-trait>) (amount uint) (lock-blocks uint))
+    (let (
+        (current-stake (default-to 
+            {
+                amount: u0, 
+                power: u0, 
+                lock-until: u0, 
+                delegation: none
+            } 
+            (map-get? governance-stakes { staker: tx-sender })
+        ))
+        (gov-token (unwrap! (var-get governance-token) ERR-NOT-AUTHORIZED))
+        (power (* amount (+ u1 (/ lock-blocks u1000))))
+    )
+        (asserts! (is-eq (contract-of token) gov-token) ERR-NOT-AUTHORIZED)
+        
+        (try! (contract-call? token transfer amount tx-sender (as-contract tx-sender) none))
+        
+        (map-set governance-stakes
+            { staker: tx-sender }
+            {
+                amount: (+ (get amount current-stake) amount),
+                power: (+ (get power current-stake) power),
+                lock-until: (+ stacks-block-height lock-blocks),
+                delegation: (get delegation current-stake)
+            }
+        )
+        
+        (ok power)
+    )
+)
+
+(define-public (delegate-votes (delegate-to principal))
+    (let (
+        (current-stake (unwrap! (map-get? governance-stakes { staker: tx-sender }) ERR-NOT-AUTHORIZED))
+    )
+        (map-set governance-stakes
+            { staker: tx-sender }
+            (merge current-stake {
+                delegation: (some delegate-to)
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+;; PRICE ORACLE SYSTEM
+
+(define-public (update-price-oracle (pool-id uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (time-elapsed (- stacks-block-height (get price-timestamp pool)))
+        (price-cumulative (* (/ (get reserve-y pool) (get reserve-x pool)) time-elapsed))
+    )
+        (asserts! (< pool-id (var-get next-pool-id)) ERR-POOL-NOT-FOUND)
+        (asserts! (> time-elapsed u0) ERR-ORACLE-STALE)
+        (asserts! (> (get reserve-x pool) u0) ERR-ZERO-LIQUIDITY)
+        
+        (map-set pools
+            { pool-id: pool-id }
+            (merge pool {
+                price-cumulative-last: (+ (get price-cumulative-last pool) price-cumulative),
+                price-timestamp: stacks-block-height,
+                twap: (/ price-cumulative time-elapsed)
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+;; ADMIN FUNCTIONS
+
+(define-public (toggle-emergency-shutdown)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok (var-set emergency-shutdown (not (var-get emergency-shutdown))))
+    )
+)
+
+(define-public (set-protocol-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-fee u1000) ERR-NOT-AUTHORIZED)
+        (ok (var-set protocol-fee-rate new-fee))
+    )
+)
