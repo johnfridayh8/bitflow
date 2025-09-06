@@ -130,3 +130,139 @@
         )
     )
 )
+
+(define-private (check-price-impact (amount uint) (reserve uint))
+    (<= (/ (* amount u10000) reserve) MAX-PRICE-IMPACT)
+)
+
+;; READ-ONLY FUNCTIONS
+
+(define-read-only (get-pool-details (pool-id uint))
+    (ok (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+)
+
+(define-read-only (get-twap-price (pool-id uint))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info 
+        (if (>= (- stacks-block-height (get price-timestamp pool-info)) ORACLE-VALIDITY-PERIOD)
+            (err ERR-ORACLE-STALE)
+            (ok (get twap pool-info))
+        )
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (calculate-swap-output (pool-id uint) (input-amount uint) (is-x-to-y bool))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info 
+        (let (
+            (reserve-in (if is-x-to-y (get reserve-x pool-info) (get reserve-y pool-info)))
+            (reserve-out (if is-x-to-y (get reserve-y pool-info) (get reserve-x pool-info)))
+            (fee-adjustment (- FEE-DENOMINATOR (get fee-rate pool-info)))
+        )
+            (ok {
+                output: (/ (* input-amount (* reserve-out fee-adjustment)) 
+                          (+ (* reserve-in FEE-DENOMINATOR) (* input-amount fee-adjustment))),
+                fee: (/ (* input-amount (get fee-rate pool-info)) FEE-DENOMINATOR)
+            })
+        )
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (get-provider-info (pool-id uint) (provider principal))
+    (ok (unwrap! (map-get? liquidity-providers { pool-id: pool-id, provider: provider }) ERR-NOT-AUTHORIZED))
+)
+
+(define-read-only (get-governance-token)
+    (ok (var-get governance-token))
+)
+
+;; POOL MANAGEMENT FUNCTIONS
+
+(define-public (create-pool (token-x <ft-trait>) (token-y <ft-trait>) (initial-x uint) (initial-y uint))
+    (let (
+        (pool-id (var-get next-pool-id))
+        (token-x-principal (contract-of token-x))
+        (token-y-principal (contract-of token-y))
+    )
+        (asserts! (not (var-get emergency-shutdown)) ERR-EMERGENCY-SHUTDOWN)
+        (asserts! (not (is-eq token-x-principal token-y-principal)) ERR-INVALID-PAIR)
+        (asserts! (and (> initial-x u0) (> initial-y u0)) ERR-ZERO-LIQUIDITY)
+        
+        (try! (contract-call? token-x transfer initial-x tx-sender (as-contract tx-sender) none))
+        (try! (contract-call? token-y transfer initial-y tx-sender (as-contract tx-sender) none))
+        
+        (map-set pools 
+            { pool-id: pool-id }
+            {
+                token-x: token-x-principal,
+                token-y: token-y-principal,
+                reserve-x: initial-x,
+                reserve-y: initial-y,
+                total-supply: INITIAL-LIQUIDITY-TOKENS,
+                fee-rate: DEFAULT-FEE-RATE,
+                last-block: stacks-block-height,
+                price-cumulative-last: u0,
+                price-timestamp: stacks-block-height,
+                twap: u0
+            }
+        )
+        
+        (map-set liquidity-providers
+            { pool-id: pool-id, provider: tx-sender }
+            {
+                shares: INITIAL-LIQUIDITY-TOKENS,
+                staked-amount: u0,
+                last-stake-block: stacks-block-height
+            }
+        )
+        
+        (var-set next-pool-id (+ pool-id u1))
+        (ok pool-id)
+    )
+)
+
+(define-public (add-liquidity (pool-id uint) (token-x <ft-trait>) (token-y <ft-trait>) (amount-x uint) (amount-y uint) (min-shares uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (shares-to-mint (calculate-liquidity-shares amount-x amount-y (get reserve-x pool) (get reserve-y pool) (get total-supply pool)))
+    )
+        (asserts! (not (var-get emergency-shutdown)) ERR-EMERGENCY-SHUTDOWN)
+        (asserts! (is-eq (contract-of token-x) (get token-x pool)) ERR-INVALID-PAIR)
+        (asserts! (is-eq (contract-of token-y) (get token-y pool)) ERR-INVALID-PAIR)
+        (asserts! (>= shares-to-mint min-shares) ERR-MIN-TOKENS)
+        
+        (try! (contract-call? token-x transfer amount-x tx-sender (as-contract tx-sender) none))
+        (try! (contract-call? token-y transfer amount-y tx-sender (as-contract tx-sender) none))
+        
+        (map-set pools
+            { pool-id: pool-id }
+            (merge pool {
+                reserve-x: (+ (get reserve-x pool) amount-x),
+                reserve-y: (+ (get reserve-y pool) amount-y),
+                total-supply: (+ (get total-supply pool) shares-to-mint)
+            })
+        )
+        
+        (match (map-get? liquidity-providers { pool-id: pool-id, provider: tx-sender })
+            prev-balance
+            (map-set liquidity-providers
+                { pool-id: pool-id, provider: tx-sender }
+                (merge prev-balance {
+                    shares: (+ (get shares prev-balance) shares-to-mint)
+                })
+            )
+            (map-set liquidity-providers
+                { pool-id: pool-id, provider: tx-sender }
+                {
+                    shares: shares-to-mint,
+                    staked-amount: u0,
+                    last-stake-block: stacks-block-height
+                }
+            )
+        )
+        
+        (ok shares-to-mint)
+    )
+)
