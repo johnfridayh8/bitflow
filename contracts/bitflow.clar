@@ -266,3 +266,127 @@
         (ok shares-to-mint)
     )
 )
+
+;; TRADING FUNCTIONS
+
+(define-public (swap-exact-x-for-y (pool-id uint) (token-x <ft-trait>) (token-y <ft-trait>) (amount-x uint) (min-y uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (swap-output (unwrap! (calculate-swap-output pool-id amount-x true) ERR-POOL-NOT-FOUND))
+        (output-amount (get output swap-output))
+        (fee-amount (get fee swap-output))
+    )
+        (asserts! (not (var-get emergency-shutdown)) ERR-EMERGENCY-SHUTDOWN)
+        (asserts! (is-eq (contract-of token-x) (get token-x pool)) ERR-INVALID-PAIR)
+        (asserts! (is-eq (contract-of token-y) (get token-y pool)) ERR-INVALID-PAIR)
+        (asserts! (>= output-amount min-y) ERR-MIN-TOKENS)
+        (asserts! (check-price-impact amount-x (get reserve-x pool)) ERR-PRICE-IMPACT-HIGH)
+        
+        (try! (contract-call? token-x transfer amount-x tx-sender (as-contract tx-sender) none))
+        (try! (as-contract (contract-call? token-y transfer output-amount (as-contract tx-sender) tx-sender none)))
+        
+        (map-set pools
+            { pool-id: pool-id }
+            (merge pool {
+                reserve-x: (+ (get reserve-x pool) amount-x),
+                reserve-y: (- (get reserve-y pool) output-amount),
+                last-block: stacks-block-height
+            })
+        )
+        
+        (var-set total-fees-collected (+ (var-get total-fees-collected) fee-amount))
+        (ok output-amount)
+    )
+)
+
+;; FLASH LOAN SYSTEM
+
+(define-public (flash-swap (pool-id uint) (token-x <ft-trait>) (token-y <ft-trait>) (amount-x uint) (callback-contract <flash-loan-callback-trait>))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (loan-id (var-get next-loan-id))
+        (fee (/ (* amount-x FLASH-LOAN-FEE) FEE-DENOMINATOR))
+    )
+        (asserts! (not (var-get emergency-shutdown)) ERR-EMERGENCY-SHUTDOWN)
+        (asserts! (is-eq (contract-of token-x) (get token-x pool)) ERR-INVALID-PAIR)
+        (asserts! (is-eq (contract-of token-y) (get token-y pool)) ERR-INVALID-PAIR)
+        
+        (map-set flash-loans
+            { loan-id: loan-id }
+            {
+                borrower: tx-sender,
+                amount: amount-x,
+                token: (contract-of token-x),
+                due-block: (+ stacks-block-height u1)
+            }
+        )
+        
+        (try! (as-contract (contract-call? token-x transfer 
+            amount-x 
+            (as-contract tx-sender) 
+            tx-sender 
+            none)))
+        
+        (try! (contract-call? callback-contract execute-flash-swap loan-id pool-id))
+        
+        (let ((updated-pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND)))
+            (asserts! (>= (get reserve-x updated-pool) (+ (get reserve-x pool) fee)) ERR-FLASH-LOAN-FAILED)
+            
+            (var-set next-loan-id (+ loan-id u1))
+            (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
+            (ok loan-id)
+        )
+    )
+)
+
+;; YIELD FARMING SYSTEM
+
+(define-public (create-farm (pool-id uint) (reward-token principal) (reward-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (map-set yield-farms
+            { pool-id: pool-id }
+            {
+                reward-token: reward-token,
+                reward-per-block: reward-rate,
+                total-staked: u0,
+                last-reward-block: stacks-block-height,
+                accumulated-reward-per-share: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (stake-in-farm (pool-id uint) (amount uint))
+    (let (
+        (provider-info (unwrap! (map-get? liquidity-providers { pool-id: pool-id, provider: tx-sender }) ERR-NOT-AUTHORIZED))
+        (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+    )
+        (map-set liquidity-providers
+            { pool-id: pool-id, provider: tx-sender }
+            (merge provider-info {
+                staked-amount: (+ (get staked-amount provider-info) amount),
+                last-stake-block: stacks-block-height
+            })
+        )
+        
+        (map-set yield-farms
+            { pool-id: pool-id }
+            (merge farm {
+                total-staked: (+ (get total-staked farm) amount)
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+;; GOVERNANCE SYSTEM
+
+(define-public (set-governance-token (token principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok (var-set governance-token (some token)))
+    )
+)
